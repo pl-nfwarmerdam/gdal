@@ -2031,6 +2031,12 @@ GDALCreateGenImgProjTransformer2( GDALDatasetH hSrcDS, GDALDatasetH hDstDS,
         }
         psInfo->pSrcTransformer
             = static_cast<GDALTransformerInfo *>(psInfo->pSrcTransformArg)->pfnTransform;
+        if( pszSrcSRS == nullptr )
+        {
+            // assume the transformer is to WGS84 if we do not know otherwise.
+            oSrcSRS.SetFromUserInput(SRS_WKT_WGS84_LAT_LONG);
+            oSrcSRS.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        }
     }
 
     else
