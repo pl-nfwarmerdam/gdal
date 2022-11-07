@@ -2236,6 +2236,32 @@ GDALCreateGenImgProjTransformer2( GDALDatasetH hSrcDS, GDALDatasetH hDstDS,
             }
         }
     }
+    else if( pszDstMethod != nullptr )
+    {
+        // Try to instantiate as a registered transformatio method.
+        // What about passing transformer options? 
+        psInfo->pDstTransformArg =
+            GDALCreateTransformer(pszMethod, hDstDS, "DST_", papszOptions);
+        if( psInfo->pDstTransformArg == nullptr )
+        {
+            CPLError(CE_Failure, CPLE_AppDefined,
+                     "Unable to compute a %s based transformation between "
+                     "pixel/line and georeferenced coordinates for %s.",
+                     pszDstMethod, GDALGetDescription(hDstDS));
+            
+            GDALDestroyGenImgProjTransformer( psInfo );
+            return nullptr;
+        }
+        psInfo->pDstTransformer
+            = static_cast<GDALTransformerInfo *>(psInfo->pDstTransformArg)->pfnTransform;
+        if( pszDstSRS == nullptr )
+        {
+            // assume the transformer is to WGS84 if we do not know otherwise.
+            oDstSRS.SetFromUserInput(SRS_WKT_WGS84_LAT_LONG);
+            oDstSRS.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        }
+    }
+
     else
     {
         CPLError(CE_Failure, CPLE_AppDefined,
@@ -4490,7 +4516,10 @@ void *GDALCreateTransformer(const char *pszMethod,
         pszOptionValue = CSLFetchNameValueDef(
             papszOptions, osOptionName.Printf("%s%s_XML", pszOptionsPrefix, pszMethod), NULL);
     }
-    if( pszOptionValue == nullptr )
+    // only fallback to unprefixed values if it is a source transformer
+    // to avoid picking up source (default) transformer options with
+    // destination transformers in GDALCreateGenImgProjTransformer().
+    if( pszOptionValue == nullptr && !EQUAL(pszOptionsPrefix,"DST_") )
         pszOptionValue = CSLFetchNameValueDef(
             papszOptions, osOptionName.Printf("%s_XML", pszMethod), NULL);
 
