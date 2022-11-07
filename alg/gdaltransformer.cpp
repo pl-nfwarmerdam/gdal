@@ -64,6 +64,10 @@ void *GDALDeserializeGCPTransformer( CPLXMLNode *psTree );
 void *GDALDeserializeTPSTransformer( CPLXMLNode *psTree );
 void *GDALDeserializeGeoLocTransformer( CPLXMLNode *psTree );
 void *GDALDeserializeRPCTransformer( CPLXMLNode *psTree );
+static void *GDALCreateTransformer(const char *pszMethod,
+                                   GDALDatasetH hDS,
+                                   const char *pszOptionsPrefix,
+                                   char **papszOptions);
 CPL_C_END
 
 static CPLXMLNode *GDALSerializeReprojectionTransformer( void *pTransformArg );
@@ -2011,13 +2015,28 @@ GDALCreateGenImgProjTransformer2( GDALDatasetH hSrcDS, GDALDatasetH hDstDS,
 
     else if( pszMethod != nullptr )
     {
-        CPLError(CE_Failure, CPLE_AppDefined,
-                 "Unable to compute a %s based transformation between "
-                 "pixel/line and georeferenced coordinates for %s.",
-                 pszMethod, GDALGetDescription(hSrcDS));
-
-        GDALDestroyGenImgProjTransformer( psInfo );
-        return nullptr;
+        // Try to instantiate as a registered transformatio method.
+        // What about passing transformer options? 
+        psInfo->pSrcTransformArg =
+            GDALCreateTransformer(pszMethod, hSrcDS, "SRC_", papszOptions);
+        if( psInfo->pSrcTransformArg == nullptr )
+        {
+            CPLError(CE_Failure, CPLE_AppDefined,
+                     "Unable to compute a %s based transformation between "
+                     "pixel/line and georeferenced coordinates for %s.",
+                     pszMethod, GDALGetDescription(hSrcDS));
+            
+            GDALDestroyGenImgProjTransformer( psInfo );
+            return nullptr;
+        }
+        psInfo->pSrcTransformer
+            = static_cast<GDALTransformerInfo *>(psInfo->pSrcTransformArg)->pfnTransform;
+        if( pszSrcSRS == nullptr )
+        {
+            // assume the transformer is to WGS84 if we do not know otherwise.
+            oSrcSRS.SetFromUserInput(SRS_WKT_WGS84_LAT_LONG);
+            oSrcSRS.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        }
     }
 
     else
@@ -2217,6 +2236,32 @@ GDALCreateGenImgProjTransformer2( GDALDatasetH hSrcDS, GDALDatasetH hDstDS,
             }
         }
     }
+    else if( pszDstMethod != nullptr )
+    {
+        // Try to instantiate as a registered transformatio method.
+        // What about passing transformer options? 
+        psInfo->pDstTransformArg =
+            GDALCreateTransformer(pszMethod, hDstDS, "DST_", papszOptions);
+        if( psInfo->pDstTransformArg == nullptr )
+        {
+            CPLError(CE_Failure, CPLE_AppDefined,
+                     "Unable to compute a %s based transformation between "
+                     "pixel/line and georeferenced coordinates for %s.",
+                     pszDstMethod, GDALGetDescription(hDstDS));
+            
+            GDALDestroyGenImgProjTransformer( psInfo );
+            return nullptr;
+        }
+        psInfo->pDstTransformer
+            = static_cast<GDALTransformerInfo *>(psInfo->pDstTransformArg)->pfnTransform;
+        if( pszDstSRS == nullptr )
+        {
+            // assume the transformer is to WGS84 if we do not know otherwise.
+            oDstSRS.SetFromUserInput(SRS_WKT_WGS84_LAT_LONG);
+            oDstSRS.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        }
+    }
+
     else
     {
         CPLError(CE_Failure, CPLE_AppDefined,
@@ -4417,6 +4462,87 @@ void GDALCleanupTransformDeserializerMutex()
 }
 
 /************************************************************************/
+/*                       GDALCreateTransformer()                        */
+/************************************************************************/
+
+void *GDALCreateTransformer(const char *pszMethod,
+                            GDALDatasetH hDS,
+                            const char *pszOptionsPrefix,
+                            char **papszOptions)
+{
+    if( EQUAL(pszMethod, "GenImgProjTransformer")
+        || EQUAL(pszMethod, "ReprojectionTransformer")
+        || EQUAL(pszMethod, "GCPTransformer")
+        || EQUAL(pszMethod, "TPSTransformer")
+        || EQUAL(pszMethod, "GeoLocTransformer")
+        || EQUAL(pszMethod, "RPCTransformer")
+        || EQUAL(pszMethod, "ApproxTransformer"))
+    {
+        CPLError( CE_Failure, CPLE_AppDefined,
+                  "GDALCreateTransformer() does not support built-in method %s yet.",
+                  pszMethod);
+        return nullptr;
+    }
+ 
+/* ==================================================================== */
+/*      Is this a registered transformer method?                        */
+/* ==================================================================== */
+    TransformDeserializerInfo* psInfo = nullptr;
+    {
+        CPLMutexHolderD(&hDeserializerMutex);
+        CPLList* psList = psListDeserializer;
+        while( psList )
+        {
+            psInfo = static_cast<TransformDeserializerInfo *>(psList->pData);
+            if( EQUAL(psInfo->pszTransformName, pszMethod) )
+                break;
+
+            psInfo = nullptr;
+            psList = psList->psNext;
+        }
+    }
+
+    if (psInfo == nullptr) 
+        return nullptr;
+
+/* -------------------------------------------------------------------- */
+/*      For now we just support the XML deserialization approach.       */
+/* -------------------------------------------------------------------- */
+    CPLString osOptionName;
+    const char *pszOptionValue;
+
+    if( pszOptionsPrefix != nullptr )
+    {
+        pszOptionValue = CSLFetchNameValueDef(
+            papszOptions, osOptionName.Printf("%s%s_XML", pszOptionsPrefix, pszMethod), NULL);
+    }
+    // only fallback to unprefixed values if it is a source transformer
+    // to avoid picking up source (default) transformer options with
+    // destination transformers in GDALCreateGenImgProjTransformer().
+    if( pszOptionValue == nullptr && !EQUAL(pszOptionsPrefix,"DST_") )
+        pszOptionValue = CSLFetchNameValueDef(
+            papszOptions, osOptionName.Printf("%s_XML", pszMethod), NULL);
+
+    if( pszOptionValue == NULL )
+    {
+        CPLError(CE_Failure, CPLE_AppDefined,
+                 "No %s_XML argument available to instantiate transformer.",
+                 pszMethod);
+        return nullptr;
+    }
+    
+    CPLXMLNode *psTree = CPLParseXMLFile(pszOptionValue);
+    if( psTree == NULL )
+    {
+        return nullptr;
+    }
+
+    void *pRet = psInfo->pfnDeserializeFunc( psTree );
+    CPLDestroyXMLNode(psTree);
+    return pRet;
+}
+
+/************************************************************************/
 /*                     GDALDeserializeTransformer()                     */
 /************************************************************************/
 
@@ -4478,7 +4604,7 @@ CPLErr GDALDeserializeTransformer( CPLXMLNode *psTree,
             {
                 TransformDeserializerInfo* psInfo =
                     static_cast<TransformDeserializerInfo *>(psList->pData);
-                if( strcmp(psInfo->pszTransformName, psTree->pszValue) == 0 )
+                if( EQUAL(psInfo->pszTransformName, psTree->pszValue) )
                 {
                     *ppfnFunc = psInfo->pfnTransformerFunc;
                     pfnDeserializeFunc = psInfo->pfnDeserializeFunc;
